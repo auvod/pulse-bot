@@ -1,0 +1,383 @@
+import os
+import sqlite3
+import secrets
+import asyncio
+from datetime import datetime, timezone
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DB = "pulse.db"
+
+if not TOKEN or not ADMIN_ID:
+    raise RuntimeError("Set BOT_TOKEN and ADMIN_ID in hosting settings")
+
+bot = Bot(TOKEN)
+dp = Dispatcher()
+
+
+def connect():
+    db = sqlite3.connect(DB)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            ref INTEGER DEFAULT 0,
+            balance INTEGER DEFAULT 0
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS promos (
+            code TEXT PRIMARY KEY,
+            reward INTEGER NOT NULL,
+            limit_count INTEGER NOT NULL,
+            used INTEGER DEFAULT 0,
+            expires TEXT NOT NULL,
+            text TEXT NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS activations (
+            user_id INTEGER,
+            code TEXT,
+            PRIMARY KEY (user_id, code)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            status TEXT DEFAULT 'pending'
+        )
+    """)
+    db.commit()
+    return db
+
+
+def keyboard(user_id):
+    buttons = [
+        [InlineKeyboardButton(text="🔗 Моя ссылка", callback_data="ref")],
+        [InlineKeyboardButton(text="💰 Баланс", callback_data="balance")],
+        [InlineKeyboardButton(text="🎟 Активировать промокод", callback_data="promo")],
+        [InlineKeyboardButton(text="💸 Запросить вывод", callback_data="withdraw")],
+    ]
+    if user_id == ADMIN_ID:
+        buttons.append([
+            InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin")
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    uid = message.from_user.id
+    db = connect()
+    row = db.execute("SELECT id FROM users WHERE id=?", (uid,)).fetchone()
+
+    if not row:
+        ref = 0
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1 and parts[1].isdigit():
+            ref = int(parts[1])
+            if ref == uid:
+                ref = 0
+            if ref and not db.execute(
+                "SELECT id FROM users WHERE id=?", (ref,)
+            ).fetchone():
+                ref = 0
+
+        db.execute(
+            "INSERT INTO users(id, ref) VALUES(?, ?)", (uid, ref)
+        )
+        if ref:
+            db.execute(
+                "UPDATE users SET balance=balance+10 WHERE id=?", (ref,)
+            )
+        db.commit()
+
+    db.close()
+    await message.answer(
+        "🔥 Добро пожаловать в PULSE BOT!\nВыбери действие:",
+        reply_markup=keyboard(uid)
+    )
+
+
+@dp.callback_query(F.data == "ref")
+async def referral(call: CallbackQuery):
+    uid = call.from_user.id
+    me = await bot.get_me()
+    db = connect()
+    count = db.execute(
+        "SELECT COUNT(*) FROM users WHERE ref=?", (uid,)
+    ).fetchone()[0]
+    db.close()
+    await call.message.answer(
+        f"🔗 Твоя ссылка:\nhttps://t.me/{me.username}?start={uid}\n"
+        f"👥 Приглашено: {count}\n"
+        "Награда за приглашение: 10 условных единиц."
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "balance")
+async def balance(call: CallbackQuery):
+    db = connect()
+    row = db.execute(
+        "SELECT balance FROM users WHERE id=?",
+        (call.from_user.id,)
+    ).fetchone()
+    db.close()
+    amount = row[0] if row else 0
+    await call.message.answer(f"💰 Твой баланс: {amount}")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "promo")
+async def promo_begin(call: CallbackQuery):
+    await call.message.answer("Отправь промокод одним сообщением:")
+    await call.answer()
+    # Next message is processed by the promo command below.
+
+
+@dp.message(Command("promo"))
+async def promo_command(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /promo КОД")
+        return
+    code = parts[1].strip().upper()
+    db = connect()
+    promo = db.execute(
+        "SELECT reward, limit_count, used, expires, text "
+        "FROM promos WHERE code=?", (code,)
+    ).fetchone()
+    if not promo:
+        db.close()
+        await message.answer("❌ Промокод не найден.")
+        return
+    reward, limit_count, used, expires, text = promo
+    now = datetime.now(timezone.utc).isoformat()
+    activated = db.execute(
+        "SELECT 1 FROM activations WHERE user_id=? AND code=?",
+        (message.from_user.id, code)
+    ).fetchone()
+    if activated or used >= limit_count or now >= expires:
+        db.close()
+        await message.answer("❌ Промокод уже использован, истёк или лимит исчерпан.")
+        return
+    db.execute(
+        "UPDATE users SET balance=balance+? WHERE id=?",
+        (reward, message.from_user.id)
+    )
+    db.execute(
+        "UPDATE promos SET used=used+1 WHERE code=?", (code,)
+    )
+    db.execute(
+        "INSERT INTO activations(user_id, code) VALUES(?, ?)",
+        (message.from_user.id, code)
+    )
+    db.commit()
+    db.close()
+    await message.answer(f"✅ {text}\nНачислено: {reward}")
+
+
+@dp.callback_query(F.data == "withdraw")
+async def withdraw_begin(call: CallbackQuery):
+    await call.message.answer("Чтобы запросить вывод, отправь:\n/withdraw СУММА")
+    await call.answer()
+
+
+@dp.message(Command("withdraw"))
+async def withdraw(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Пример: /withdraw 100")
+        return
+    amount = int(parts[1])
+    if amount <= 0:
+        await message.answer("Сумма должна быть больше нуля.")
+        return
+
+    db = connect()
+    row = db.execute(
+        "SELECT balance FROM users WHERE id=?", (message.from_user.id,)
+    ).fetchone()
+    if not row or row[0] < amount:
+        db.close()
+        await message.answer("❌ Недостаточно средств.")
+        return
+
+    db.execute(
+        "UPDATE users SET balance=balance-? WHERE id=?",
+        (amount, message.from_user.id)
+    )
+    cur = db.execute(
+        "INSERT INTO withdrawals(user_id, amount) VALUES(?, ?)",
+        (message.from_user.id, amount)
+    )
+    wid = cur.lastrowid
+    db.commit()
+    db.close()
+
+    buttons = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{wid}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{wid}")
+    ]])
+    await bot.send_message(
+        ADMIN_ID,
+        f"💸 Заявка #{wid}\nПользователь: {message.from_user.id}\n"
+        f"Сумма: {amount}",
+        reply_markup=buttons
+    )
+    await message.answer("✅ Заявка отправлена администратору на рассмотрение.")
+
+
+@dp.callback_query(F.data == "admin")
+async def admin_panel(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    buttons = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="newpromo")]
+    ])
+    await call.message.answer("👑 PULSE BOT — админ-панель", reply_markup=buttons)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "stats")
+async def stats(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    db = connect()
+    users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    balance = db.execute("SELECT COALESCE(SUM(balance),0) FROM users").fetchone()[0]
+    pending = db.execute(
+        "SELECT COUNT(*) FROM withdrawals WHERE status='pending'"
+    ).fetchone()[0]
+    db.close()
+    await call.message.answer(
+        f"📊 Пользователей: {users}\n"
+        f"💰 Общий баланс: {balance}\n"
+        f"⏳ Заявок ожидают: {pending}"
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "newpromo")
+async def newpromo(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await call.message.answer(
+        "Создание промокода пока доступно командой:\n"
+        "/createpromo КОД НАГРАДА ЛИМИТ ДАТА ТЕКСТ\n"
+        "Дата: YYYY-MM-DD\n"
+        "Пример:\n/createpromo PULSE10 10 100 2027-01-01 Привет от PULSE!"
+    )
+    await call.answer()
+
+
+@dp.message(Command("createpromo"))
+async def createpromo(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Нет доступа.")
+        return
+    parts = message.text.split(maxsplit=5)
+    if len(parts) != 6:
+        await message.answer(
+            "Формат:\n/createpromo КОД НАГРАДА ЛИМИТ YYYY-MM-DD ТЕКСТ"
+        )
+        return
+    _, code, reward, limit_count, expires, promo_text = parts
+    try:
+        reward = int(reward)
+        limit_count = int(limit_count)
+        datetime.strptime(expires, "%Y-%m-%d")
+        if reward <= 0 or limit_count <= 0:
+            raise ValueError
+        expires = datetime.strptime(expires, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        ).isoformat()
+    except ValueError:
+        await message.answer("Проверь награду, лимит и дату.")
+        return
+
+    code = code.upper()
+    db = connect()
+    try:
+        db.execute(
+            "INSERT INTO promos(code, reward, limit_count, expires, text) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (code, reward, limit_count, expires, promo_text)
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        await message.answer("Такой промокод уже существует.")
+        db.close()
+        return
+    db.close()
+    await message.answer(f"✅ Промокод {code} создан.")
+
+
+@dp.callback_query(F.data.startswith("approve:"))
+async def approve(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    wid = int(call.data.split(":")[1])
+    db = connect()
+    row = db.execute(
+        "SELECT user_id, amount, status FROM withdrawals WHERE id=?", (wid,)
+    ).fetchone()
+    if not row or row[2] != "pending":
+        db.close()
+        await call.answer("Заявка уже обработана.", show_alert=True)
+        return
+    db.execute("UPDATE withdrawals SET status='approved' WHERE id=?", (wid,))
+    db.commit()
+    db.close()
+    await bot.send_message(row[0], f"✅ Заявка #{wid} одобрена. Выполни выплату вручную.")
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("Одобрено")
+
+
+@dp.callback_query(F.data.startswith("reject:"))
+async def reject(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    wid = int(call.data.split(":")[1])
+    db = connect()
+    row = db.execute(
+        "SELECT user_id, amount, status FROM withdrawals WHERE id=?", (wid,)
+    ).fetchone()
+    if not row or row[2] != "pending":
+        db.close()
+        await call.answer("Заявка уже обработана.", show_alert=True)
+        return
+    db.execute("UPDATE withdrawals SET status='rejected' WHERE id=?", (wid,))
+    db.execute(
+        "UPDATE users SET balance=balance+? WHERE id=?", (row[1], row[0])
+    )
+    db.commit()
+    db.close()
+    await bot.send_message(row[0], f"❌ Заявка #{wid} отклонена. Баланс возвращён.")
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("Отклонено")
+
+
+async def main():
+    connect().close()
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
